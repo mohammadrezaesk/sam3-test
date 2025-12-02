@@ -302,10 +302,11 @@ with gr.Blocks() as demo:
                         step=1,
                         info="Maximum number of frames to process from the video"
                     )
+                with gr.Row():
                     avg_frame_checkbox = gr.Checkbox(
-                        label="avg_frame",
+                        label="Process Middle Frame of Each Second",
                         value=False,
-                        info="Process only middle frame of each second (optimized)"
+                        info="Optimized for faster processing"
                     )
                 video_submit_btn = gr.Button("🚀 Process", variant="primary", size="lg")
                 video_status = gr.Textbox(
