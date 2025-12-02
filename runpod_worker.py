@@ -1,10 +1,10 @@
 """
 SAM3 RunPod Serverless Worker
-Deploy this as a serverless endpoint on RunPod.
+Downloads model from Hugging Face at runtime and serves inference requests.
 
 Usage:
-1. Build a Docker image with this file and SAM3 dependencies
-2. Deploy to RunPod as a serverless endpoint
+1. Build Docker image with this file
+2. Deploy to RunPod as serverless endpoint
 3. Use the endpoint ID in your client
 """
 
@@ -17,20 +17,41 @@ from PIL import Image
 
 import runpod
 
-# SAM3 imports
-from sam3.model_builder import build_sam3_image_model
-from sam3.model.sam3_image_processor import Sam3Processor
-
-# Transformers imports for video
-from transformers import Sam3VideoModel, Sam3VideoProcessor
-from transformers.video_utils import load_video
-from accelerate import Accelerator
-
 # Global model instances (loaded once, reused across requests)
 image_model = None
 image_processor = None
 video_model = None
 video_processor = None
+
+
+def download_model_from_hf():
+    """Download SAM3 model from Hugging Face if not exists"""
+    from huggingface_hub import snapshot_download, login
+    
+    model_dir = os.environ.get("SAM3_MODEL_DIR", "/app/sam3-files")
+    checkpoint_path = os.path.join(model_dir, "sam3.pt")
+    
+    # Check if already downloaded
+    if os.path.exists(checkpoint_path):
+        print(f"✅ Model already exists at {model_dir}")
+        return model_dir
+    
+    print("📥 Downloading SAM3 model from Hugging Face...")
+    
+    # Login if token provided
+    hf_token = os.environ.get("HF_TOKEN")
+    if hf_token:
+        login(token=hf_token)
+    
+    # Download model
+    snapshot_download(
+        repo_id="facebook/sam3",
+        local_dir=model_dir,
+        local_dir_use_symlinks=False
+    )
+    
+    print(f"✅ Model downloaded to {model_dir}")
+    return model_dir
 
 
 def load_models():
@@ -41,27 +62,23 @@ def load_models():
         return  # Already loaded
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Loading SAM3 models on device: {device}")
+    print(f"🚀 Loading SAM3 models on device: {device}")
     
-    # Get model path from environment or use default
-    model_dir = os.environ.get("SAM3_MODEL_DIR", "/runpod-volume/sam3-files")
+    # Download model if needed
+    model_dir = download_model_from_hf()
     checkpoint_path = os.path.join(model_dir, "sam3.pt")
     
     if not os.path.exists(checkpoint_path):
-        # Try alternative paths
-        alt_paths = ["sam3-files/sam3.pt", "/workspace/sam3-files/sam3.pt"]
-        for alt in alt_paths:
-            if os.path.exists(alt):
-                checkpoint_path = alt
-                model_dir = os.path.dirname(alt)
-                break
-        else:
-            raise FileNotFoundError(f"Model checkpoint not found. Tried: {checkpoint_path}, {alt_paths}")
+        raise FileNotFoundError(f"Model checkpoint not found at {checkpoint_path}")
     
     # Enable TF32 for Ampere GPUs
     if device == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+    
+    # Import SAM3 modules
+    from sam3.model_builder import build_sam3_image_model
+    from sam3.model.sam3_image_processor import Sam3Processor
     
     # Load image model
     print("Loading image model...")
@@ -76,23 +93,31 @@ def load_models():
     
     confidence_threshold = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.5"))
     image_processor = Sam3Processor(image_model, confidence_threshold=confidence_threshold)
-    print("Image model loaded!")
+    print("✅ Image model loaded!")
     
     # Load video model
-    print("Loading video model...")
-    accelerator = Accelerator()
-    video_device = accelerator.device
-    
-    video_model = Sam3VideoModel.from_pretrained(
-        model_dir,
-        local_files_only=True
-    ).to(video_device, dtype=torch.bfloat16 if video_device.type == "cuda" else torch.float32)
-    
-    video_processor = Sam3VideoProcessor.from_pretrained(
-        model_dir,
-        local_files_only=True
-    )
-    print("Video model loaded!")
+    try:
+        from transformers import Sam3VideoModel, Sam3VideoProcessor
+        from accelerate import Accelerator
+        
+        print("Loading video model...")
+        accelerator = Accelerator()
+        video_device = accelerator.device
+        
+        video_model = Sam3VideoModel.from_pretrained(
+            model_dir,
+            local_files_only=True
+        ).to(video_device, dtype=torch.bfloat16 if video_device.type == "cuda" else torch.float32)
+        
+        video_processor = Sam3VideoProcessor.from_pretrained(
+            model_dir,
+            local_files_only=True
+        )
+        print("✅ Video model loaded!")
+    except Exception as e:
+        print(f"⚠️ Video model not loaded: {e}")
+        video_model = None
+        video_processor = None
 
 
 def decode_base64_image(base64_string: str) -> Image.Image:
@@ -159,6 +184,11 @@ def segment_image(image_base64: str, prompt: str, confidence_threshold: float = 
 
 def process_video_frames(frames_base64: list, prompt: str, max_frames: int = 30):
     """Process video frames with text prompt"""
+    if video_model is None or video_processor is None:
+        return {"error": "Video model not available"}
+    
+    from accelerate import Accelerator
+    
     # Decode frames
     frames = [decode_base64_image(f) for f in frames_base64[:max_frames]]
     
@@ -241,7 +271,7 @@ def handler(job):
     """
     job_input = job["input"]
     
-    # Ensure models are loaded
+    # Ensure models are loaded (downloads from HF on first run)
     load_models()
     
     task = job_input.get("task", "image")
@@ -275,10 +305,10 @@ def handler(job):
             return {"error": f"Unknown task: {task}. Use 'image' or 'video'"}
             
     except Exception as e:
-        return {"error": str(e)}
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
 
 
 # For local testing
 if __name__ == "__main__":
     runpod.serverless.start({"handler": handler})
-
