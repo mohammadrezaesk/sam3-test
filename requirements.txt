@@ -1,4 +1,0 @@
-runpod
-pillow
-requests
-huggingface_hub
